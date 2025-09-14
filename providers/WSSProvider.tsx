@@ -23,6 +23,24 @@ function makeDeviceId(): string {
   return 'hm-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+function getCloseCodeName(code: number): string {
+  const codes: { [key: number]: string } = {
+    1000: 'Normal Closure',
+    1001: 'Going Away',
+    1002: 'Protocol Error',
+    1003: 'Unsupported Data',
+    1005: 'No Status Received',
+    1006: 'Abnormal Closure',
+    1007: 'Invalid Frame Payload Data',
+    1008: 'Policy Violation',
+    1009: 'Message Too Big',
+    1010: 'Mandatory Extension',
+    1011: 'Internal Server Error',
+    1015: 'TLS Handshake'
+  };
+  return codes[code] || 'Unknown';
+}
+
 
 
 export const [WSSProvider, useWSS] = createContextHook(() => {
@@ -222,6 +240,12 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     urlRef.current = url;
     console.log('🔗 Connecting to WSS relay:', url);
     
+    // Add connection timeout tracking
+    const connectionStart = Date.now();
+    
+    // Check if we're in a development environment or if the server is unreachable
+    const isDevelopment = __DEV__ || process.env.NODE_ENV === 'development';
+    
     let ws: WebSocket;
     try {
       // Check if WebSocket is available (works on both web and native)
@@ -237,6 +261,9 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       console.log('✅ WebSocket instance created successfully');
     } catch (error) {
       console.error('Failed to create WebSocket:', error);
+      if (isDevelopment) {
+        console.log('🔧 Development mode: WebSocket creation failed, continuing offline');
+      }
       lockRef.current = false;
       setS('offline');
       return;
@@ -244,12 +271,19 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     wsRef.current = ws;
 
     const openTimeout = setTimeout(() => {
-      console.log('⏰ Connection timeout');
+      console.log('⏰ Connection timeout - server may be unreachable');
+      if (isDevelopment) {
+        console.log('🔧 Development mode: Continuing with offline functionality');
+        lockRef.current = false;
+        setS('offline');
+        return;
+      }
       try { ws.close(); } catch {}
     }, 8000);
 
     ws.onopen = () => {
-      console.log('✅ WebSocket connected to relay');
+      const connectionTime = Date.now() - connectionStart;
+      console.log(`✅ WebSocket connected to relay in ${connectionTime}ms`);
       clearTimeout(openTimeout);
       backoffRef.current = 1000;
       setS('connected');
@@ -287,6 +321,10 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       const trimmed = txt.trim();
       if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
         console.log('⚠️ Received non-JSON message, ignoring:', txt.substring(0, 100));
+        // Check if it's an HTTP response (common WebSocket error)
+        if (trimmed.startsWith('HTTP/') || trimmed.includes('Connection') || trimmed.includes('Request')) {
+          console.error('❌ Received HTTP response instead of WebSocket data - server may not support WebSocket protocol');
+        }
         return;
       }
       
@@ -337,8 +375,14 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
           }
         }
       } catch (parseError) {
-        console.error('ERROR Failed to parse message:', parseError);
+        const errorMsg = parseError instanceof Error ? parseError.message : String(parseError);
+        console.error('ERROR Failed to parse message:', errorMsg);
         console.log('Raw message that failed to parse:', txt.substring(0, 200));
+        
+        // Check for common parsing issues
+        if (errorMsg.includes('Unexpected identifier') || errorMsg.includes('Unexpected character')) {
+          console.error('❌ Server sent malformed data - this may indicate a server-side issue');
+        }
         
         // Don't treat parse errors as fatal - just ignore malformed messages
         return;
@@ -346,52 +390,75 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     };
 
     ws.onclose = (e) => {
-      console.log('🔌 WebSocket closed:', e.code, e.reason);
+      const closeReason = e.reason || 'No reason provided';
+      const closeCodeName = getCloseCodeName(e.code);
+      console.log(`🔌 WebSocket closed: ${e.code} (${closeCodeName}) - ${closeReason}`);
+      
       clearTimeout(openTimeout);
       stopHB();
       stopRetryLoop();
       setS('offline');
       lockRef.current = false;
       
-      // Only reconnect if not manually closed
+      // Only reconnect if not manually closed and not in development with repeated failures
       if (e.code !== 1000) {
-        console.log(`🔄 Reconnecting in ${backoffRef.current}ms...`);
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-        }
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (wsRef.current === ws) { // Only reconnect if this is still the current connection
-            connect();
+        const shouldReconnect = !isDevelopment || backoffRef.current < 10000;
+        
+        if (shouldReconnect) {
+          console.log(`🔄 Reconnecting in ${backoffRef.current}ms...`);
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
           }
-        }, backoffRef.current);
-        backoffRef.current = Math.min(backoffRef.current * 1.5, 30000);
+          reconnectTimeoutRef.current = setTimeout(() => {
+            if (wsRef.current === ws) { // Only reconnect if this is still the current connection
+              connect();
+            }
+          }, backoffRef.current);
+          backoffRef.current = Math.min(backoffRef.current * 1.5, 30000);
+        } else {
+          console.log('🔧 Development mode: Stopping reconnection attempts after repeated failures');
+        }
       }
     };
 
     ws.onerror = (error) => {
-      console.error('🚨 WebSocket error:', error);
-      
-      // Extract error details safely
+      // Extract error details more safely
+      let errorInfo = 'Unknown error';
       let errorDetails: any = {
         readyState: ws.readyState,
-        url: urlRef.current
+        url: urlRef.current,
+        timestamp: new Date().toISOString()
       };
       
       try {
         if (error && typeof error === 'object') {
-          errorDetails = {
-            ...errorDetails,
-            type: (error as any).type || 'unknown',
-            message: (error as any).message || 'No message',
-            code: (error as any).code || 'No code',
-            isTrusted: (error as any).isTrusted || false
-          };
+          // Handle different error types
+          if ('message' in error && error.message) {
+            errorInfo = String(error.message);
+          } else if ('type' in error && error.type) {
+            errorInfo = `Error type: ${error.type}`;
+          }
+          
+          // Extract common error properties
+          const errorProps = ['type', 'message', 'code', 'isTrusted', 'target'];
+          errorProps.forEach(prop => {
+            if (prop in error && (error as any)[prop] !== undefined) {
+              errorDetails[prop] = (error as any)[prop];
+            }
+          });
         }
       } catch (e) {
-        console.log('Could not extract error details');
+        errorInfo = 'Failed to extract error details';
       }
       
-      console.error('ERROR Error details:', errorDetails);
+      console.error('🚨 WebSocket error:', errorInfo);
+      console.error('ERROR Error details:', JSON.stringify(errorDetails, null, 2));
+      
+      // In development, provide helpful guidance
+      if (isDevelopment && errorInfo.includes('Invalid Sec-WebSocket-Accept')) {
+        console.log('💡 Development tip: The relay server may not be running or may not support WebSocket connections');
+        console.log('💡 The app will continue to work in offline mode for testing');
+      }
       
       // Don't change state here, let onclose handle it
     };
