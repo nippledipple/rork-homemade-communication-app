@@ -107,20 +107,27 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       const interval = baseInterval + (Math.random() - 0.5) * 2 * variance;
       
       hbTimer.current = setTimeout(() => {
-
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) {
-          const pingMsg = { type: 'ping' };
+          const pingMsg = { type: 'ping', ts: Date.now() };
           ws.send(JSON.stringify(pingMsg));
-          console.log('📡 Ping sent');
+          console.log('📡 Ping sent with timestamp');
           
           // Check for pong response after 5 seconds
           setTimeout(() => {
-            missedRef.current++;
-            console.log(`⏰ Missed pongs: ${missedRef.current}`);
-            if (missedRef.current >= 2) {
-              console.log('💔 Too many missed pongs (2), closing connection for reconnect');
-              try { wsRef.current?.close(); } catch {}
+            if (missedRef.current < 2) { // Only increment if we haven't already detected the miss
+              missedRef.current++;
+              console.log(`⏰ Missed pongs: ${missedRef.current}/2`);
+              if (missedRef.current >= 2) {
+                console.log('💔 Too many missed pongs (2/2), closing connection for reconnect');
+                try { 
+                  if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    wsRef.current.close(1000, 'Heartbeat timeout');
+                  }
+                } catch (e) {
+                  console.log('Error closing connection after heartbeat timeout:', e);
+                }
+              }
             }
           }, 5000);
         }
@@ -256,6 +263,7 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     const url = `wss://relay.homemade.app/edge?deviceId=${encodeURIComponent(deviceId)}&v=app`;
     urlRef.current = url;
     console.log('🔗 Connecting to WSS relay:', url);
+    console.log('🔑 Device ID:', deviceId);
     
     // Add connection timeout tracking
     const connectionStart = Date.now();
@@ -264,17 +272,31 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     try {
       // Check if WebSocket is available (works on both web and native)
       if (typeof WebSocket === 'undefined' && typeof global !== 'undefined' && !global.WebSocket) {
-        console.error('WebSocket not available in this environment');
+        console.error('❌ WebSocket not available in this environment');
         lockRef.current = false;
         setS('offline');
         return;
       }
       
-      // Create WebSocket connection
+      // Create WebSocket connection with proper error handling
+      console.log('🔧 Creating WebSocket connection...');
       ws = new WebSocket(url);
-      console.log('✅ WebSocket instance created successfully');
+      console.log('✅ WebSocket instance created, readyState:', ws.readyState);
+      
+      // Immediately check if connection failed during creation
+      if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        console.error('❌ WebSocket closed immediately after creation');
+        lockRef.current = false;
+        setS('offline');
+        return;
+      }
     } catch (error) {
-      console.error('Failed to create WebSocket:', error);
+      console.error('❌ Failed to create WebSocket:', error);
+      console.error('Error details:', {
+        name: error instanceof Error ? error.name : 'Unknown',
+        message: error instanceof Error ? error.message : String(error),
+        url: url
+      });
       lockRef.current = false;
       setS('offline');
       return;
@@ -282,16 +304,24 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     wsRef.current = ws;
 
     const openTimeout = setTimeout(() => {
-      console.log('⏰ Connection timeout - server may be unreachable');
+      console.log('⏰ Connection timeout after 10s - server may be unreachable');
+      console.log('🔧 Server status: relay.homemade.app may be down or misconfigured');
       console.log('🔧 Continuing with offline functionality');
       lockRef.current = false;
       setS('offline');
-      try { ws.close(); } catch {}
-    }, 5000);
+      try { 
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, 'Connection timeout');
+        }
+      } catch (e) {
+        console.log('Error closing timed out connection:', e);
+      }
+    }, 10000);
 
     ws.onopen = () => {
       const connectionTime = Date.now() - connectionStart;
-      console.log(`✅ WebSocket connected to relay in ${connectionTime}ms`);
+      console.log(`✅ WSS Relay: Verbunden in ${connectionTime}ms`);
+      console.log('🔗 Connection established to relay.homemade.app');
       clearTimeout(openTimeout);
       backoffRef.current = 1000;
       setS('connected');
@@ -299,12 +329,12 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       startRetryLoop();
       lockRef.current = false;
       
-      // Send initial ping to establish connection
+      // Send initial ping to establish connection and measure latency
       setTimeout(() => {
         if (ws.readyState === WebSocket.OPEN) {
-          const pingMsg = { type: 'ping' };
+          const pingMsg = { type: 'ping', ts: Date.now() };
           ws.send(JSON.stringify(pingMsg));
-          console.log('📡 Initial ping sent');
+          console.log('📡 Initial ping sent with timestamp');
         }
       }, 100);
     };
@@ -345,7 +375,7 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
           missedRef.current = 0;
           const latency = msg.ts ? Date.now() - msg.ts : 0;
           setPingMs(latency);
-          console.log(`🏓 Pong received: ${latency}ms`);
+          console.log(`🏓 Pong received: ${latency}ms (${latency > 0 ? 'Ping' : 'Server'})`);
 
         } else if (msg?.type === 'msg' && msg.sid && msg.sid !== deviceId) {
           // Message from another device (not our own echo)
@@ -401,14 +431,28 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       const closeReason = e.reason || 'No reason provided';
       const closeCodeName = getCloseCodeName(e.code);
       console.log(`🔌 WebSocket closed: ${e.code} (${closeCodeName}) - ${closeReason}`);
+      console.log('🔧 Close event details:', {
+        code: e.code,
+        reason: e.reason,
+        wasClean: e.wasClean,
+        url: urlRef.current,
+        timestamp: new Date().toISOString()
+      });
       
       // Log specific close codes for debugging
       if (e.code === 1006) {
         console.error('❌ Abnormal Close - Connection lost unexpectedly');
+        console.error('🔧 This usually indicates network issues or server problems');
       } else if (e.code === 1008) {
-        console.error('❌ Policy Violation - Server rejected connection (possibly missing deviceId)');
+        console.error('❌ Policy Violation - Server rejected connection');
+        console.error('🔧 Check if deviceId is properly formatted:', deviceId);
       } else if (e.code === 1015) {
         console.error('❌ TLS/Certificate Pinning failure');
+        console.error('🔧 Certificate validation failed for relay.homemade.app');
+      } else if (e.code === 1002) {
+        console.error('❌ Protocol Error - Server doesn\'t support WebSocket properly');
+      } else if (e.code === 1011) {
+        console.error('❌ Internal Server Error - relay.homemade.app server issue');
       }
       
       clearTimeout(openTimeout);
@@ -417,14 +461,15 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       setS('offline');
       lockRef.current = false;
       
-      // Only reconnect if not manually closed
-      if (e.code !== 1000) {
+      // Only reconnect if not manually closed and not a permanent error
+      const permanentErrors = [1008, 1002]; // Policy violation, protocol error
+      if (e.code !== 1000 && !permanentErrors.includes(e.code)) {
         // Implement exponential backoff: 1s, 2s, 4s, 8s, 15s max
         const backoffDelays = [1000, 2000, 4000, 8000, 15000];
-        const currentBackoff = Math.min(backoffRef.current, backoffDelays.length - 1);
-        const delay = backoffDelays[currentBackoff];
+        const currentBackoffIndex = Math.min(backoffRef.current - 1000, backoffDelays.length - 1);
+        const delay = backoffDelays[Math.max(0, Math.floor(currentBackoffIndex / 1000))] || 1000;
         
-        console.log(`🔄 Reconnecting in ${delay}ms... (attempt ${backoffRef.current + 1})`);
+        console.log(`🔄 Reconnecting in ${delay}ms... (backoff level: ${Math.floor(currentBackoffIndex / 1000) + 1})`);
         
         if (reconnectTimeoutRef.current) {
           clearTimeout(reconnectTimeoutRef.current);
@@ -432,10 +477,13 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
         
         reconnectTimeoutRef.current = setTimeout(() => {
           if (wsRef.current === ws) { // Only reconnect if this is still the current connection
-            backoffRef.current = Math.min(backoffRef.current + 1, backoffDelays.length - 1);
+            backoffRef.current = Math.min(backoffRef.current * 1.5, 15000);
             connect();
           }
         }, delay);
+      } else if (permanentErrors.includes(e.code)) {
+        console.error('❌ Permanent error detected - not attempting reconnection');
+        console.error('🔧 Please check server configuration and deviceId format');
       }
     };
 
