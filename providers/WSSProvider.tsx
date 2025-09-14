@@ -99,29 +99,45 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
   const startHB = useCallback(() => {
     if (hbTimer.current) clearInterval(hbTimer.current);
     missedRef.current = 0;
-    hbTimer.current = setInterval(() => {
-      const ts = Date.now();
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const pingMsg = { type: 'ping', ts, deviceId: deviceId };
-        ws.send(JSON.stringify(pingMsg));
-        console.log('📡 Ping sent');
-      }
-      // Timeout for pong response
-      setTimeout(() => {
-        missedRef.current++;
-        console.log(`⏰ Missed pongs: ${missedRef.current}`);
-        if (missedRef.current >= 3) {
-          console.log('💔 Too many missed pongs, closing connection');
-          try { wsRef.current?.close(); } catch {}
+    
+    // Send ping every ~15s ±20% (12-18s random interval)
+    const scheduleNextPing = () => {
+      const baseInterval = 15000; // 15 seconds
+      const variance = baseInterval * 0.2; // ±20%
+      const interval = baseInterval + (Math.random() - 0.5) * 2 * variance;
+      
+      hbTimer.current = setTimeout(() => {
+
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          const pingMsg = { type: 'ping' };
+          ws.send(JSON.stringify(pingMsg));
+          console.log('📡 Ping sent');
+          
+          // Check for pong response after 5 seconds
+          setTimeout(() => {
+            missedRef.current++;
+            console.log(`⏰ Missed pongs: ${missedRef.current}`);
+            if (missedRef.current >= 2) {
+              console.log('💔 Too many missed pongs (2), closing connection for reconnect');
+              try { wsRef.current?.close(); } catch {}
+            }
+          }, 5000);
         }
-      }, 8000);
-    }, 12000);
-  }, [deviceId]);
+        
+        // Schedule next ping
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          scheduleNextPing();
+        }
+      }, interval);
+    };
+    
+    scheduleNextPing();
+  }, []);
   
   const stopHB = useCallback(() => {
     if (hbTimer.current) {
-      clearInterval(hbTimer.current);
+      clearTimeout(hbTimer.current);
       hbTimer.current = null;
     }
   }, []);
@@ -235,20 +251,9 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     lockRef.current = true;
     setS(state === 'offline' ? 'connecting' : 'reconnecting');
 
-    // Check if we're in a development environment
-    const isDevelopment = __DEV__ || process.env.NODE_ENV === 'development';
-    
-    // In development or demo mode, don't attempt real connections
-    if (isDevelopment) {
-      console.log('🔧 Development mode: Skipping WebSocket connection, staying offline');
-      console.log('💡 This is normal in development/demo environments');
-      lockRef.current = false;
-      setS('offline');
-      return;
-    }
-
     // Connect to real relay server for device-to-device communication
-    const url = `wss://relay.homemade.app/edge?deviceId=${encodeURIComponent(deviceId)}`;
+    // Use exact URL format as specified: wss://relay.homemade.app/edge?deviceId=<DEVICE_ID_URLENCODED>&v=app
+    const url = `wss://relay.homemade.app/edge?deviceId=${encodeURIComponent(deviceId)}&v=app`;
     urlRef.current = url;
     console.log('🔗 Connecting to WSS relay:', url);
     
@@ -297,7 +302,7 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       // Send initial ping to establish connection
       setTimeout(() => {
         if (ws.readyState === WebSocket.OPEN) {
-          const pingMsg = { type: 'ping', ts: Date.now(), deviceId: deviceId };
+          const pingMsg = { type: 'ping' };
           ws.send(JSON.stringify(pingMsg));
           console.log('📡 Initial ping sent');
         }
@@ -335,12 +340,12 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
         const msg = JSON.parse(trimmed);
         console.log('📨 WSS received:', msg.type, msg.id || msg.ctr || '');
         
-        if (msg?.type === 'pong' && typeof msg.ts === 'number') {
+        if (msg?.type === 'pong') {
           // Real pong response from relay server
           missedRef.current = 0;
-          const latency = Date.now() - msg.ts;
+          const latency = msg.ts ? Date.now() - msg.ts : 0;
           setPingMs(latency);
-          console.log(`🏓 Pong: ${latency}ms`);
+          console.log(`🏓 Pong received: ${latency}ms`);
 
         } else if (msg?.type === 'msg' && msg.sid && msg.sid !== deviceId) {
           // Message from another device (not our own echo)
@@ -397,42 +402,45 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       const closeCodeName = getCloseCodeName(e.code);
       console.log(`🔌 WebSocket closed: ${e.code} (${closeCodeName}) - ${closeReason}`);
       
+      // Log specific close codes for debugging
+      if (e.code === 1006) {
+        console.error('❌ Abnormal Close - Connection lost unexpectedly');
+      } else if (e.code === 1008) {
+        console.error('❌ Policy Violation - Server rejected connection (possibly missing deviceId)');
+      } else if (e.code === 1015) {
+        console.error('❌ TLS/Certificate Pinning failure');
+      }
+      
       clearTimeout(openTimeout);
       stopHB();
       stopRetryLoop();
       setS('offline');
       lockRef.current = false;
       
-      // Only reconnect if not manually closed and not in development
-      if (e.code !== 1000 && !isDevelopment) {
-        // Limit reconnection attempts to prevent spam
-        if (backoffRef.current < 30000) {
-          console.log(`🔄 Reconnecting in ${backoffRef.current}ms...`);
-          if (reconnectTimeoutRef.current) {
-            clearTimeout(reconnectTimeoutRef.current);
-          }
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (wsRef.current === ws) { // Only reconnect if this is still the current connection
-              connect();
-            }
-          }, backoffRef.current);
-          backoffRef.current = Math.min(backoffRef.current * 2, 30000);
-        } else {
-          console.log('🛑 Max reconnection attempts reached, staying offline');
+      // Only reconnect if not manually closed
+      if (e.code !== 1000) {
+        // Implement exponential backoff: 1s, 2s, 4s, 8s, 15s max
+        const backoffDelays = [1000, 2000, 4000, 8000, 15000];
+        const currentBackoff = Math.min(backoffRef.current, backoffDelays.length - 1);
+        const delay = backoffDelays[currentBackoff];
+        
+        console.log(`🔄 Reconnecting in ${delay}ms... (attempt ${backoffRef.current + 1})`);
+        
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
         }
-      } else if (isDevelopment) {
-        console.log('🔧 Development mode: Not attempting reconnection');
+        
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (wsRef.current === ws) { // Only reconnect if this is still the current connection
+            backoffRef.current = Math.min(backoffRef.current + 1, backoffDelays.length - 1);
+            connect();
+          }
+        }, delay);
       }
     };
 
     ws.onerror = (error) => {
-      // In development mode, suppress detailed error logging to reduce noise
-      if (isDevelopment) {
-        console.log('🔧 WebSocket connection failed (expected in development mode)');
-        return;
-      }
-      
-      // Extract error details more safely for production
+      // Extract error details more safely
       let errorInfo = 'Connection failed';
       let errorDetails: any = {
         readyState: ws.readyState,
@@ -457,15 +465,18 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
             }
           });
         }
-      } catch (e) {
+      } catch {
         errorInfo = 'Network connection failed';
       }
       
-      console.warn('⚠️ WebSocket connection issue:', errorInfo);
+      console.error('🚨 WebSocket error:', errorInfo);
+      console.error('ERROR Error details:', JSON.stringify(errorDetails, null, 2));
       
-      // Provide user-friendly error context
-      if (errorInfo.includes('Invalid Sec-WebSocket-Accept') || errorInfo.includes('Network')) {
-        console.log('💡 Server may be temporarily unavailable. App will work in offline mode.');
+      // Check for specific error types
+      if (errorInfo.includes('Invalid Sec-WebSocket-Accept')) {
+        console.error('❌ Server WebSocket handshake failed - check server configuration');
+      } else if (errorInfo.includes('TLS') || errorInfo.includes('certificate')) {
+        console.error('❌ TLS_PIN_MISMATCH - Certificate pinning failed');
       }
       
       // Don't change state here, let onclose handle it
