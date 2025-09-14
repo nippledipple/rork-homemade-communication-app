@@ -235,6 +235,18 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     lockRef.current = true;
     setS(state === 'offline' ? 'connecting' : 'reconnecting');
 
+    // Check if we're in a development environment
+    const isDevelopment = __DEV__ || process.env.NODE_ENV === 'development';
+    
+    // In development or demo mode, don't attempt real connections
+    if (isDevelopment) {
+      console.log('🔧 Development mode: Skipping WebSocket connection, staying offline');
+      console.log('💡 This is normal in development/demo environments');
+      lockRef.current = false;
+      setS('offline');
+      return;
+    }
+
     // Connect to real relay server for device-to-device communication
     const url = `wss://relay.homemade.app/edge?deviceId=${encodeURIComponent(deviceId)}`;
     urlRef.current = url;
@@ -242,9 +254,6 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
     
     // Add connection timeout tracking
     const connectionStart = Date.now();
-    
-    // Check if we're in a development environment or if the server is unreachable
-    const isDevelopment = __DEV__ || process.env.NODE_ENV === 'development';
     
     let ws: WebSocket;
     try {
@@ -261,9 +270,6 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       console.log('✅ WebSocket instance created successfully');
     } catch (error) {
       console.error('Failed to create WebSocket:', error);
-      if (isDevelopment) {
-        console.log('🔧 Development mode: WebSocket creation failed, continuing offline');
-      }
       lockRef.current = false;
       setS('offline');
       return;
@@ -272,14 +278,11 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
 
     const openTimeout = setTimeout(() => {
       console.log('⏰ Connection timeout - server may be unreachable');
-      if (isDevelopment) {
-        console.log('🔧 Development mode: Continuing with offline functionality');
-        lockRef.current = false;
-        setS('offline');
-        return;
-      }
+      console.log('🔧 Continuing with offline functionality');
+      lockRef.current = false;
+      setS('offline');
       try { ws.close(); } catch {}
-    }, 8000);
+    }, 5000);
 
     ws.onopen = () => {
       const connectionTime = Date.now() - connectionStart;
@@ -400,11 +403,10 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
       setS('offline');
       lockRef.current = false;
       
-      // Only reconnect if not manually closed and not in development with repeated failures
-      if (e.code !== 1000) {
-        const shouldReconnect = !isDevelopment || backoffRef.current < 10000;
-        
-        if (shouldReconnect) {
+      // Only reconnect if not manually closed and not in development
+      if (e.code !== 1000 && !isDevelopment) {
+        // Limit reconnection attempts to prevent spam
+        if (backoffRef.current < 30000) {
           console.log(`🔄 Reconnecting in ${backoffRef.current}ms...`);
           if (reconnectTimeoutRef.current) {
             clearTimeout(reconnectTimeoutRef.current);
@@ -414,16 +416,24 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
               connect();
             }
           }, backoffRef.current);
-          backoffRef.current = Math.min(backoffRef.current * 1.5, 30000);
+          backoffRef.current = Math.min(backoffRef.current * 2, 30000);
         } else {
-          console.log('🔧 Development mode: Stopping reconnection attempts after repeated failures');
+          console.log('🛑 Max reconnection attempts reached, staying offline');
         }
+      } else if (isDevelopment) {
+        console.log('🔧 Development mode: Not attempting reconnection');
       }
     };
 
     ws.onerror = (error) => {
-      // Extract error details more safely
-      let errorInfo = 'Unknown error';
+      // In development mode, suppress detailed error logging to reduce noise
+      if (isDevelopment) {
+        console.log('🔧 WebSocket connection failed (expected in development mode)');
+        return;
+      }
+      
+      // Extract error details more safely for production
+      let errorInfo = 'Connection failed';
       let errorDetails: any = {
         readyState: ws.readyState,
         url: urlRef.current,
@@ -439,8 +449,8 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
             errorInfo = `Error type: ${error.type}`;
           }
           
-          // Extract common error properties
-          const errorProps = ['type', 'message', 'code', 'isTrusted', 'target'];
+          // Extract common error properties (but limit to avoid circular references)
+          const errorProps = ['type', 'message', 'code', 'isTrusted'];
           errorProps.forEach(prop => {
             if (prop in error && (error as any)[prop] !== undefined) {
               errorDetails[prop] = (error as any)[prop];
@@ -448,16 +458,14 @@ export const [WSSProvider, useWSS] = createContextHook(() => {
           });
         }
       } catch (e) {
-        errorInfo = 'Failed to extract error details';
+        errorInfo = 'Network connection failed';
       }
       
-      console.error('🚨 WebSocket error:', errorInfo);
-      console.error('ERROR Error details:', JSON.stringify(errorDetails, null, 2));
+      console.warn('⚠️ WebSocket connection issue:', errorInfo);
       
-      // In development, provide helpful guidance
-      if (isDevelopment && errorInfo.includes('Invalid Sec-WebSocket-Accept')) {
-        console.log('💡 Development tip: The relay server may not be running or may not support WebSocket connections');
-        console.log('💡 The app will continue to work in offline mode for testing');
+      // Provide user-friendly error context
+      if (errorInfo.includes('Invalid Sec-WebSocket-Accept') || errorInfo.includes('Network')) {
+        console.log('💡 Server may be temporarily unavailable. App will work in offline mode.');
       }
       
       // Don't change state here, let onclose handle it
